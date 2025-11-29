@@ -273,8 +273,9 @@ func main() {
 			} else {
 				// 4b. Success: Store message in log and print
 				storeMessage(seq, messagePayload)
-				fmt.Printf("[PUB] Successfully sent Seq: %d, Broker: %s, Response: %s", seq, connectedAddr, strings.TrimSpace(response))
+				fmt.Printf("[PUB] Successfully sent Seq: %d, Broker: %s, Response: %s\n", seq, connectedAddr, strings.TrimSpace(response))
 			}
 		}
 	}
 }
+
