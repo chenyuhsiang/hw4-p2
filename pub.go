@@ -19,7 +19,7 @@ var (
 	backupAddr  string
 	serverType  = "tcp"
 	topic       string
-	ackTimeout  = 500 * time.Millisecond
+	ackTimeout  = 500 * time.Millisecond // Required 500ms ACK timeout
 )
 
 // Active state for publisher
@@ -29,12 +29,12 @@ var (
 	maxRetries      = 3
 	seq         int = 0
 
-	// Control Variable for Failover Test (Used by connectWithRetry)
+	// Control Variable for Failover (Primary is assumed alive until ACK timeout)
 	primaryAlive bool = true
 
-	// Message Log: Stores the last 5 sent messages (Sequence Number -> Payload)
-	recentMessages    *list.List = list.New() // list.Element.Value will be of type SentMessage
-	maxRecentMessages            = 5          // Required 5 messages
+	// Stores the last 5 sent messages
+	recentMessages    *list.List = list.New()
+	maxRecentMessages            = 5
 	logMutex          sync.Mutex
 )
 
@@ -45,9 +45,9 @@ type SentMessage struct {
 }
 
 func init() {
-	flag.StringVar(&primaryAddr, "primary-addr", primaryAddr, "Primary Broker Address (host:port)")
-	flag.StringVar(&backupAddr, "backup-addr", backupAddr, "Backup Broker Address (host:port)")
-	flag.StringVar(&topic, "topic", topic, "Topic name for publishing messages (Assignment Requirement: topicC)")
+	flag.StringVar(&primaryAddr, "primary-addr", "localhost:5555", "Primary Broker Address")
+	flag.StringVar(&backupAddr, "backup-addr", "localhost:5556", "Backup Broker Address")
+	flag.StringVar(&topic, "topic", "topicC", "Topic name for publishing messages")
 }
 
 // storeMessage logs the message and maintains the maxRecentMessages limit.
@@ -72,16 +72,17 @@ func connectWithRetry() (net.Conn, string, error) {
 	if primaryAlive {
 		addresses = []string{primaryAddr, backupAddr}
 	} else {
-		// After Primary failure simulation, only try Backup
+		// After Primary failure is detected, only try Backup
 		addresses = []string{backupAddr}
 	}
+
+	// Calculate max attempts (e.g., 3 retries on Primary, then 3 retries on Backup)
+	maxAttempts := maxRetries * len(addresses)
 
 	// Initialize or switch currentAddr for the first attempt
 	if currentAddr == "" {
 		currentAddr = addresses[0]
 	}
-
-	maxAttempts := maxRetries * len(addresses)
 
 	for attempt := 0; attempt < maxAttempts; attempt++ {
 		// Determine which address to try next based on the addresses list
@@ -117,10 +118,8 @@ func sendRecentMessagesToBackup() {
 
 	fmt.Println("\n--- !!! Primary Crash Detected: Resending last 5 messages to Backup Broker !!! ---")
 
-	// If Backup is not available, we rely on the main loop's connectWithRetry
 	conn, err := net.DialTimeout(serverType, backupAddr, 1*time.Second)
 	if err != nil {
-		// 確保錯誤訊息使用 backupAddr
 		fmt.Printf("[RESEND] Cannot connect to Backup Broker %s to resend messages: %v\n", backupAddr, err)
 		return
 	}
@@ -138,18 +137,15 @@ func sendRecentMessagesToBackup() {
 		_, err := conn.Write([]byte(publishCmd))
 		if err != nil {
 			fmt.Printf("[RESEND] Failed to send Seq: %d to Backup %s: %v\n", msg.Seq, backupAddr, err)
-			// Continue to next message if send fails
 			continue
 		}
 
-		// Wait for ACK from the backup (Backup will NACK if not Primary, which is fine,
-		// the goal is to *send* the messages to the Backup's address)
+		// Wait for ACK/NACK from the backup
 		conn.SetReadDeadline(time.Now().Add(ackTimeout))
 		response, err := reader.ReadString('\n')
 
-		// If Backup NACKs (Not Primary) or ACK (after failover), the purpose is served.
 		if strings.HasPrefix(response, "ACK") {
-			fmt.Printf("[RESEND] Successfully resent Seq: %d, Response: %s", msg.Seq, strings.TrimSpace(response))
+			fmt.Printf("[RESEND] Successfully resent Seq: %d, Response: %s\n", msg.Seq, strings.TrimSpace(response))
 		} else if strings.HasPrefix(response, "NACK") {
 			fmt.Printf("[RESEND] Sent Seq: %d, Backup NACKed: %s (Expected before failover)\n", msg.Seq, strings.TrimSpace(response))
 		} else {
@@ -173,11 +169,9 @@ func printRecentMessagesAndExit(reason string) {
 	fmt.Println("\n--- Last 5 Sent Messages (for verification) ---")
 	for e := recentMessages.Front(); e != nil; e = e.Next() {
 		msg := e.Value.(SentMessage)
-		fmt.Println("  ", fmt.Sprintf("Seq: %d, Payload: %s", msg.Seq, msg.Payload))
+		fmt.Println("   ", fmt.Sprintf("Seq: %d, Payload: %s", msg.Seq, msg.Payload))
 	}
 	logMutex.Unlock()
-
-	// Explicitly exit the process
 	os.Exit(0)
 }
 
@@ -195,10 +189,6 @@ func main() {
 	// Total experiment run time
 	totalTimer := time.After(30 * time.Second)
 
-	// 30 seconds mark for Primary Broker Failure Simulation (simulated by the publisher)
-	failoverTimer := time.After(30 * time.Second)
-
-	// Channel for OS signals (Ctrl+C, etc.)
 	exitChan := make(chan os.Signal, 1)
 	// Register to catch interrupt and terminate signals
 	signal.Notify(exitChan, syscall.SIGINT, syscall.SIGTERM)
@@ -206,20 +196,12 @@ func main() {
 	for {
 		select {
 
-		// Handle OS termination signal (Ctrl+C)
+		// Handle OS termination signal
 		case sig := <-exitChan:
 			printRecentMessagesAndExit(fmt.Sprintf("Signal Received: %v", sig))
 			return
 
-		// Timer for Primary Broker Failure Simulation
-		case <-failoverTimer:
-			// NOTE: This simulation is to *stop* the publisher from connecting to the primary
-			// for *future* messages. The *actual* failover/resend is triggered by the ACK timeout.
-			fmt.Println("\n--- !!! SIMULATING Primary Broker FAILURE TIME (30s) !!! ---")
-			// We still rely on the ACK timeout logic for the actual resend,
-			// but we ensure the *next* successful connection is to the Backup address.
-			// The logic in the ACK check handles the state change (primaryAlive = false, currentAddr = backupAddr).
-
+		// Timer for Total Test Time
 		case <-totalTimer:
 			printRecentMessagesAndExit("Total Test Time Expired (30s)")
 			return
@@ -237,7 +219,6 @@ func main() {
 				continue
 			}
 
-			// Format the PUBLISH command: PUBLISH <topic> <seq> <message>
 			publishCmd := fmt.Sprintf("PUBLISH %s %d %s\n", topic, seq, messagePayload)
 
 			// 2. Send PUBLISH request
@@ -258,7 +239,7 @@ func main() {
 			conn.Close()
 
 			if err != nil || !strings.HasPrefix(response, "ACK") {
-				// 4a. Failure: ACK failed/timeout
+				// Failure: ACK failed/timeout
 				fmt.Printf("[PUB] Failed to receive ACK for Seq: %d (Error: %v). Will retry sending this Seq next time.\n", seq, err)
 
 				// Decrement seq because processing failed (ACK not received); need to retry
@@ -271,11 +252,9 @@ func main() {
 
 				continue
 			} else {
-				// 4b. Success: Store message in log and print
 				storeMessage(seq, messagePayload)
 				fmt.Printf("[PUB] Successfully sent Seq: %d, Broker: %s, Response: %s\n", seq, connectedAddr, strings.TrimSpace(response))
 			}
 		}
 	}
 }
-
